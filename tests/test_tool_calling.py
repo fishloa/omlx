@@ -1540,3 +1540,213 @@ class TestParseToolCallsGemma4Integration:
         assert tool_calls is not None
         assert len(tool_calls) == 1
         assert tool_calls[0].function.name == "search"
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4 → OpenAI tool_calls normalisation
+# ---------------------------------------------------------------------------
+#
+# Goal: prove that parse_tool_calls() correctly normalises Gemma 4's native
+# tool-call syntax into the OpenAI-compatible shape that downstream clients
+# (opencode, codex, aider, etc.) expect:
+#
+#   {
+#     "role": "assistant",
+#     "content": null,
+#     "tool_calls": [
+#       {
+#         "type": "function",
+#         "function": {"name": <str>, "arguments": <JSON-string>}
+#       }
+#     ]
+#   }
+#
+# These tests cover the failure mode observed in production where Gemma 4
+# emits e.g.
+#   <|tool_call>call:get_weather{location:<|"|>London<|"|>}<tool_call|>
+# and the call ends up dropped to "Tool call markers found but parsing
+# failed, stripping markers" — leaving empty `tool_calls` and the call
+# silently lost.
+
+
+class TestGemma4OpenAINormalization:
+    """Gemma 4 native tool-call syntax → OpenAI tool_calls shape.
+
+    The expected result of parse_tool_calls() is:
+        (cleaned_text, [ToolCall(type="function",
+                                  function=FunctionCall(name, arguments))])
+    where ``arguments`` is a JSON string that round-trips via json.loads to
+    the typed Python dict the model intended. ``cleaned_text`` should be
+    empty (or whitespace) when the entire message was a tool call.
+    """
+
+    @staticmethod
+    def _make_gemma4_tokenizer():
+        """Mimic a Gemma 4 tokenizer: <|tool_call>...<tool_call|> markers,
+        and a tool_parser that always fails so parse_tool_calls() exercises
+        the Gemma 4 fallback path (which is the production path we hit in
+        omlx logs)."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<|tool_call>"
+        tok.tool_call_end = "<tool_call|>"
+        tok.tool_parser = MagicMock(
+            side_effect=ValueError("mlx-lm parser failed")
+        )
+        return tok
+
+    # ------------------------------------------------------------------
+    # 1. Single simple tool call
+    # ------------------------------------------------------------------
+    def test_single_simple_tool_call(self):
+        """One tool, one string argument with Gemma's <|"|> delimiters."""
+        tok = self._make_gemma4_tokenizer()
+        text = '<|tool_call>call:get_weather{location:<|"|>London<|"|>}<tool_call|>'
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is not None, "Gemma 4 native call must produce tool_calls"
+        assert len(tool_calls) == 1
+        tc = tool_calls[0]
+        assert tc.type == "function"
+        assert tc.function.name == "get_weather"
+        assert isinstance(tc.function.arguments, str), \
+            "OpenAI shape requires arguments to be a JSON string"
+        args = json.loads(tc.function.arguments)
+        assert args == {"location": "London"}
+        # Markers must be stripped — content must not leak the call back.
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+        # The whole message was the call — cleaned text should be empty.
+        assert cleaned.strip() == ""
+
+    # ------------------------------------------------------------------
+    # 2. Multiple arguments with mixed types
+    # ------------------------------------------------------------------
+    def test_multiple_arguments_typed(self):
+        """Arguments must preserve typing — strings stay strings, ints stay
+        ints, bools stay bools — through the JSON round-trip."""
+        tok = self._make_gemma4_tokenizer()
+        text = (
+            '<|tool_call>call:search_files'
+            '{query:<|"|>foo bar<|"|>, limit:10, recursive:true}'
+            '<tool_call|>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "search_files"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["query"] == "foo bar"
+        assert args["limit"] == 10
+        assert isinstance(args["limit"], int), "numeric argument must stay int"
+        assert args["recursive"] is True
+        assert isinstance(args["recursive"], bool), "boolean argument must stay bool"
+        assert cleaned.strip() == ""
+
+    # ------------------------------------------------------------------
+    # 3. String containing embedded double-quotes
+    # ------------------------------------------------------------------
+    def test_string_with_embedded_quotes(self):
+        """Gemma's <|"|> delimiters are designed precisely so a string
+        argument can itself contain double quotes (e.g. a shell command).
+        The resulting JSON must escape the embedded quotes correctly."""
+        tok = self._make_gemma4_tokenizer()
+        text = (
+            '<|tool_call>call:run_command'
+            '{cmd:<|"|>echo "hello world"<|"|>}'
+            '<tool_call|>'
+        )
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "run_command"
+        # The arguments string must be valid JSON even though the embedded
+        # value contains double quotes.
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"cmd": 'echo "hello world"'}
+        assert cleaned.strip() == ""
+
+    # ------------------------------------------------------------------
+    # 4. No tool call — ordinary content must not produce a tool_calls list
+    # ------------------------------------------------------------------
+    def test_no_tool_call_passes_through_as_content(self):
+        """Plain assistant text (no markers) must return (text, None) so the
+        OpenAI normaliser can keep it as ``content`` and avoid synthesising
+        a phantom tool call."""
+        tok = self._make_gemma4_tokenizer()
+        text = "Sure — the weather in London is currently sunny and 18°C."
+
+        cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        assert tool_calls is None, \
+            "no Gemma-4 markers means no tool_calls should be produced"
+        assert cleaned == text, "content must be preserved verbatim"
+
+    # ------------------------------------------------------------------
+    # 5. Malformed call must not raise
+    # ------------------------------------------------------------------
+    def test_malformed_does_not_crash(self, caplog):
+        """An incomplete or invalid native call must not raise; it should
+        either be returned as content or trigger a controlled parse error
+        (warning + markers stripped). It must NEVER bubble an exception
+        out of parse_tool_calls()."""
+        tok = self._make_gemma4_tokenizer()
+        # Missing closing marker — left unbalanced on purpose.
+        text = '<|tool_call>call:get_weather{location:<|"|>Lon'
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            try:
+                cleaned, tool_calls = parse_tool_calls(text, tok, None)
+            except Exception as exc:  # noqa: BLE001 — fail loudly on regression
+                pytest.fail(
+                    f"parse_tool_calls raised {type(exc).__name__} on malformed "
+                    f"Gemma-4 input — must be handled internally: {exc}"
+                )
+
+        # No exception means we passed the strict requirement. The remaining
+        # behaviour is a project convention: tool_calls may be None (treated
+        # as content) OR the markers stripped. Either is acceptable as long
+        # as it's deterministic and no exception leaks.
+        assert tool_calls is None or isinstance(tool_calls, list)
+
+    # ------------------------------------------------------------------
+    # Regression: spec-compliant arguments that DON'T use <|"|> delimiters
+    # The omlx production log at 2026-04-25 21:54 showed this exact form
+    # being dropped: ``call:multica issue get <uuid> --output json{}``.
+    # That is malformed (no proper function name / args structure), so it
+    # belongs in #5; a separate test pins the behaviour explicitly.
+    # ------------------------------------------------------------------
+    def test_production_dropped_call_does_not_crash(self, caplog):
+        """The exact pattern observed in production omlx logs:
+
+            call:multica issue get c75b2218-... --output json{}
+
+        The model conflated the function name with the bash arguments.
+        We don't expect this to *succeed* — but it must not raise, and the
+        markers must be stripped from the visible content so they don't
+        leak to the user."""
+        tok = self._make_gemma4_tokenizer()
+        text = (
+            "<|tool_call>"
+            "call:multica issue get c75b2218-c234-46aa-bac7-d4af37512a81 "
+            "--output json{}"
+            "<tool_call|>"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            cleaned, tool_calls = parse_tool_calls(text, tok, None)
+
+        # Markers must always be stripped — never leak to the API consumer.
+        assert "<|tool_call>" not in cleaned
+        assert "<tool_call|>" not in cleaned
+        # If parsing failed, a warning must be logged so operators can see it.
+        if tool_calls is None:
+            assert any(
+                "parsing failed" in m.lower() or "no function call" in m.lower()
+                for m in caplog.messages
+            ), "expected a parse-failure WARNING in logs"
